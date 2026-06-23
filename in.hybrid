@@ -1,0 +1,218 @@
+# LASER-ASSISTED COLD SPRAY DEPOSITION - LAMMPS SCRIPT
+# Optimized for performance: < 30 min runtime, < 5 GB RAM
+# Features: Substrate laser heating, particle impact, stress analysis
+
+# ============================================
+# INITIALIZATION
+# ============================================
+units           metal
+dimension       3
+atom_style      atomic
+boundary        p p s
+
+# ============================================
+# SYSTEM SETUP
+# ============================================
+lattice         fcc 4.05
+region          box block -50 50 -50 50 -20 80
+create_box      1 box
+
+# Create substrate (thinner for efficiency)
+region          substrate block -50 50 -50 50 -20 5
+create_atoms    1 region substrate
+
+# Create particle (realistic size ~10 Angstrom radius)
+region          particle sphere 0 0 40 10
+create_atoms    1 region particle
+
+# Material properties (Aluminum)
+mass            1 26.9815
+pair_style      eam/alloy
+pair_coeff      * * Al99.eam.alloy Al
+
+# ============================================
+# ENERGY MINIMIZATION
+# ============================================
+minimize        1.0e-4 1.0e-6 1000 10000
+
+# ============================================
+# GROUP DEFINITIONS
+# ============================================
+group           substrate region substrate
+group           particle region particle
+
+# Fix bottom layer only (not entire substrate)
+region          bottom block -50 50 -50 50 -20 -15
+group           bottom region bottom
+group           mobile subtract all bottom
+
+# Laser-heated zone in substrate (top layers)
+region          laser_zone block -50 50 -50 50 0 5
+group           laser_heated region laser_zone
+group           heated intersect substrate laser_heated
+group           substrate_bulk subtract substrate heated
+
+# ============================================
+# INITIAL CONDITIONS
+# ============================================
+# Freeze bottom boundary
+fix             freeze bottom setforce 0.0 0.0 0.0
+
+# Set particle velocity (cold spray: 300-1200 m/s, using 500 m/s)
+# In metal units: 500 m/s = 5 Angstrom/ps
+velocity        particle set 0.0 0.0 -5.0
+velocity        substrate set 0.0 0.0 0.0
+
+# ============================================
+# LASER HEATING SIMULATION
+# ============================================
+# Heat the top substrate layer to elevated temperature (e.g., 600K)
+# This simulates laser pre-heating before particle impact
+
+# Initial equilibration at 300K
+compute         mobile_temp mobile temp
+fix             1 mobile nve
+fix             2 heated nvt temp 300 300 0.1
+fix             3 substrate_bulk nvt temp 300 300 0.1
+
+thermo          100
+thermo_style    custom step temp c_mobile_temp ke pe etotal press
+
+# Equilibrate
+run             1000
+
+# Ramp up temperature in laser-heated zone
+unfix           2
+fix             2 heated nvt temp 300 600 0.1
+
+# Heat up over 2000 steps
+run             2000
+
+# Maintain elevated temperature during deposition
+unfix           2
+fix             2 heated nvt temp 600 600 0.1
+
+# ============================================
+# STRESS COMPUTATION
+# ============================================
+# Compute per-atom stress tensor
+compute         stress_atom all stress/atom NULL
+
+# Individual stress components
+variable        sxx atom c_stress_atom[1]
+variable        syy atom c_stress_atom[2]
+variable        szz atom c_stress_atom[3]
+variable        sxy atom c_stress_atom[4]
+variable        sxz atom c_stress_atom[5]
+variable        syz atom c_stress_atom[6]
+
+# von Mises stress
+variable        von_mises atom sqrt(0.5*((v_sxx-v_syy)^2+(v_syy-v_szz)^2+(v_szz-v_sxx)^2+6.0*(v_sxy^2+v_sxz^2+v_syz^2)))
+
+# Hydrostatic pressure
+variable        pressure atom -(v_sxx+v_syy+v_szz)/3.0
+
+# ============================================
+# NEIGHBOR SETTINGS
+# ============================================
+neighbor        2.0 bin
+neigh_modify    delay 0 every 1 check yes
+
+# ============================================
+# OUTPUT SETTINGS
+# ============================================
+thermo          100
+thermo_style    custom step temp c_mobile_temp ke pe etotal press atoms
+
+# Main trajectory with stress data
+dump            1 all custom 500 deposition.lammpstrj &
+                id type x y z &
+                c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+                c_stress_atom[4] c_stress_atom[5] c_stress_atom[6] &
+                v_von_mises v_pressure
+dump_modify     1 sort id
+
+# Simplified dump for visualization
+dump            2 all custom 500 vonmises.lammpstrj &
+                id type x y z v_von_mises
+dump_modify     2 sort id
+
+# ============================================
+# SIMULATION TIMESTEP
+# ============================================
+timestep        0.001
+
+# ============================================
+# RUN DEPOSITION SIMULATION
+# ============================================
+
+# Approach phase (particle moving toward heated substrate)
+run             2000
+
+# Impact phase (high-resolution output)
+undump          1
+undump          2
+dump            3 all custom 50 impact_detail.lammpstrj &
+                id type x y z v_von_mises v_pressure
+dump_modify     3 sort id
+
+run             4000
+
+# Post-impact relaxation
+undump          3
+dump            1 all custom 500 deposition.lammpstrj &
+                id type x y z &
+                c_stress_atom[1] c_stress_atom[2] c_stress_atom[3] &
+                c_stress_atom[4] c_stress_atom[5] c_stress_atom[6] &
+                v_von_mises v_pressure
+dump_modify     1 sort id
+
+run             4000
+
+# ============================================
+# COOLING PHASE (LASER OFF)
+# ============================================
+# Cool down the heated zone back to room temperature
+unfix           2
+fix             2 heated nvt temp 600 300 0.1
+
+run             3000
+
+# ============================================
+# FINAL ANALYSIS
+# ============================================
+# Initialize computes
+run             0
+
+# Statistics computes
+compute         max_vm all reduce max v_von_mises
+compute         avg_vm all reduce ave v_von_mises
+compute         max_press all reduce max v_pressure
+compute         min_press all reduce min v_pressure
+
+# Run 0 to evaluate
+run             0
+
+# Extract values
+variable        max_vm_val equal c_max_vm
+variable        avg_vm_val equal c_avg_vm
+variable        max_press_val equal c_max_press
+variable        min_press_val equal c_min_press
+
+# Print results
+print           "============================================"
+print           "=== LASER-ASSISTED COLD SPRAY RESULTS ==="
+print           "============================================"
+print           "Maximum von Mises stress: ${max_vm_val} bars"
+print           "Average von Mises stress: ${avg_vm_val} bars"
+print           "Maximum pressure (compression): ${max_press_val} bars"
+print           "Minimum pressure (tension): ${min_press_val} bars"
+print           "============================================"
+
+# ============================================
+# SAVE FINAL STATE
+# ============================================
+write_data      final_deposited.data
+write_restart   deposition.restart
+
+print           "Simulation completed successfully!"
